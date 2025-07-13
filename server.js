@@ -120,6 +120,18 @@ const ownerEarningsSchema = new mongoose.Schema({
   }]
 });
 
+// Owner Withdrawal Schema
+const ownerWithdrawalSchema = new mongoose.Schema({
+  amount: { type: Number, required: true },
+  method: { type: String, enum: ['mpesa', 'bank', 'paypal'], required: true },
+  accountDetails: { type: String, required: true },
+  status: { type: String, enum: ['pending', 'completed', 'failed'], default: 'pending' },
+  transactionId: String,
+  notes: String,
+  createdAt: { type: Date, default: Date.now },
+  completedAt: Date
+});
+
 // Models
 const User = mongoose.model('User', userSchema);
 const Video = mongoose.model('Video', videoSchema);
@@ -128,6 +140,7 @@ const PaymentRequest = mongoose.model('PaymentRequest', paymentRequestSchema);
 const AppSettings = mongoose.model('AppSettings', appSettingsSchema);
 const Admin = mongoose.model('Admin', adminSchema);
 const OwnerEarnings = mongoose.model('OwnerEarnings', ownerEarningsSchema);
+const OwnerWithdrawal = mongoose.model('OwnerWithdrawal', ownerWithdrawalSchema);
 
 // Email configuration
 const transporter = nodemailer.createTransporter({
@@ -562,13 +575,156 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-// Get Dashboard Stats
+// Owner Withdrawal Processing
+async function processOwnerWithdrawal(withdrawal) {
+  try {
+    let result;
+    
+    switch (withdrawal.method) {
+      case 'mpesa':
+        result = await processOwnerMpesaWithdrawal(withdrawal);
+        break;
+      case 'bank':
+        result = await processOwnerBankWithdrawal(withdrawal);
+        break;
+      case 'paypal':
+        result = await processOwnerPayPalWithdrawal(withdrawal);
+        break;
+    }
+    
+    if (result.success) {
+      withdrawal.status = 'completed';
+      withdrawal.transactionId = result.transactionId;
+      withdrawal.completedAt = new Date();
+      
+      // Deduct from owner earnings
+      const ownerEarnings = await OwnerEarnings.findOne();
+      if (ownerEarnings) {
+        ownerEarnings.totalEarnings -= withdrawal.amount;
+        await ownerEarnings.save();
+      }
+    } else {
+      withdrawal.status = 'failed';
+      withdrawal.notes = result.error;
+    }
+    
+    await withdrawal.save();
+    return result;
+  } catch (error) {
+    withdrawal.status = 'failed';
+    withdrawal.notes = error.message;
+    await withdrawal.save();
+    throw error;
+  }
+}
+
+async function processOwnerMpesaWithdrawal(withdrawal) {
+  try {
+    // M-Pesa B2C (Business to Customer) withdrawal
+    const response = await axios.post(
+      `${process.env.MPESA_BASE_URL}/mpesa/b2c/v1/paymentrequest`,
+      {
+        InitiatorName: process.env.MPESA_INITIATOR_NAME,
+        SecurityCredential: process.env.MPESA_SECURITY_CREDENTIAL,
+        CommandID: 'BusinessPayment',
+        Amount: withdrawal.amount,
+        PartyA: process.env.MPESA_SHORTCODE,
+        PartyB: withdrawal.accountDetails,
+        Remarks: 'Owner withdrawal',
+        QueueTimeOutURL: `${process.env.BASE_URL}/api/admin/owner/mpesa/timeout`,
+        ResultURL: `${process.env.BASE_URL}/api/admin/owner/mpesa/result`,
+        Occasion: 'Owner Withdrawal'
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.MPESA_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    return {
+      success: true,
+      transactionId: response.data.ConversationID
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `M-Pesa withdrawal failed: ${error.message}`
+    };
+  }
+}
+
+async function processOwnerBankWithdrawal(withdrawal) {
+  try {
+    // Simulate bank transfer - implement actual bank API
+    const transactionId = `BANK-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Log withdrawal for manual processing
+    console.log(`Bank withdrawal requested: ${withdrawal.amount} to ${withdrawal.accountDetails}`);
+    
+    return {
+      success: true,
+      transactionId
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Bank withdrawal failed: ${error.message}`
+    };
+  }
+}
+
+async function processOwnerPayPalWithdrawal(withdrawal) {
+  try {
+    // PayPal payout to owner
+    const response = await axios.post(
+      `${process.env.PAYPAL_BASE_URL}/v1/payments/payouts`,
+      {
+        sender_batch_header: {
+          sender_batch_id: `owner-batch-${withdrawal._id}`,
+          email_subject: 'Owner Withdrawal',
+          email_message: 'Your withdrawal has been processed'
+        },
+        items: [{
+          recipient_type: 'EMAIL',
+          amount: {
+            value: withdrawal.amount.toString(),
+            currency: 'USD'
+          },
+          receiver: withdrawal.accountDetails,
+          note: 'Owner withdrawal from WatchEarn',
+          sender_item_id: `owner-item-${withdrawal._id}`
+        }]
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.PAYPAL_ACCESS_TOKEN}`
+        }
+      }
+    );
+    
+    return {
+      success: true,
+      transactionId: response.data.batch_header.payout_batch_id
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `PayPal withdrawal failed: ${error.message}`
+    };
+  }
+}
+
+// Update the dashboard stats function to include withdrawal info
 app.get('/api/admin/dashboard', authenticateAdmin, async (req, res) => {
   try {
     const totalUsers = await User.countDocuments();
     const totalVideos = await Video.countDocuments();
     const totalEarnings = await OwnerEarnings.findOne() || { totalEarnings: 0, todayEarnings: 0 };
     const pendingPayments = await PaymentRequest.countDocuments({ status: 'pending' });
+    const pendingWithdrawals = await OwnerWithdrawal.countDocuments({ status: 'pending' });
     
     const recentUsers = await User.find()
       .sort({ createdAt: -1 })
@@ -579,17 +735,87 @@ app.get('/api/admin/dashboard', authenticateAdmin, async (req, res) => {
       .sort({ uploadedAt: -1 })
       .limit(5);
     
+    const recentWithdrawals = await OwnerWithdrawal.find()
+      .sort({ createdAt: -1 })
+      .limit(5);
+    
     res.json({
       totalUsers,
       totalVideos,
       totalEarnings: totalEarnings.totalEarnings,
       todayEarnings: totalEarnings.todayEarnings,
       pendingPayments,
+      pendingWithdrawals,
       recentUsers,
-      recentVideos
+      recentVideos,
+      recentWithdrawals
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// M-Pesa Owner Withdrawal Callbacks
+app.post('/api/admin/owner/mpesa/result', async (req, res) => {
+  try {
+    const { Result } = req.body;
+    
+    if (Result.ResultCode === 0) {
+      // Find withdrawal by transaction ID
+      const withdrawal = await OwnerWithdrawal.findOne({
+        transactionId: Result.ConversationID
+      });
+      
+      if (withdrawal) {
+        withdrawal.status = 'completed';
+        withdrawal.completedAt = new Date();
+        await withdrawal.save();
+        
+        // Deduct from owner earnings
+        const ownerEarnings = await OwnerEarnings.findOne();
+        if (ownerEarnings) {
+          ownerEarnings.totalEarnings -= withdrawal.amount;
+          await ownerEarnings.save();
+        }
+      }
+    } else {
+      // Handle failed withdrawal
+      const withdrawal = await OwnerWithdrawal.findOne({
+        transactionId: Result.ConversationID
+      });
+      
+      if (withdrawal) {
+        withdrawal.status = 'failed';
+        withdrawal.notes = Result.ResultDesc;
+        await withdrawal.save();
+      }
+    }
+    
+    res.status(200).json({ message: 'Result received' });
+  } catch (error) {
+    console.error('M-Pesa result callback error:', error);
+    res.status(500).json({ error: 'Callback processing failed' });
+  }
+});
+
+app.post('/api/admin/owner/mpesa/timeout', async (req, res) => {
+  try {
+    const { ConversationID } = req.body;
+    
+    const withdrawal = await OwnerWithdrawal.findOne({
+      transactionId: ConversationID
+    });
+    
+    if (withdrawal) {
+      withdrawal.status = 'failed';
+      withdrawal.notes = 'Transaction timed out';
+      await withdrawal.save();
+    }
+    
+    res.status(200).json({ message: 'Timeout received' });
+  } catch (error) {
+    console.error('M-Pesa timeout callback error:', error);
+    res.status(500).json({ error: 'Callback processing failed' });
   }
 });
 
@@ -685,6 +911,135 @@ app.get('/api/admin/videos', authenticateAdmin, async (req, res) => {
       totalPages: Math.ceil(total / limit),
       currentPage: page,
       total
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// OWNER WITHDRAWAL ROUTES
+
+// Request Owner Withdrawal
+app.post('/api/admin/owner/withdraw', authenticateAdmin, async (req, res) => {
+  try {
+    const { amount, method, notes } = req.body;
+    
+    // Check withdrawal limits
+    const limits = {
+      mpesa: parseFloat(process.env.MPESA_WITHDRAW_LIMIT),
+      bank: parseFloat(process.env.BANK_WITHDRAW_LIMIT),
+      paypal: parseFloat(process.env.PAYPAL_WITHDRAW_LIMIT)
+    };
+    
+    if (amount > limits[method]) {
+      return res.status(400).json({ 
+        error: `Amount exceeds ${method.toUpperCase()} limit of ${limits[method]}` 
+      });
+    }
+    
+    // Check available balance
+    const ownerEarnings = await OwnerEarnings.findOne();
+    if (!ownerEarnings || ownerEarnings.totalEarnings < amount) {
+      return res.status(400).json({ error: 'Insufficient owner earnings' });
+    }
+    
+    // Get account details from environment
+    let accountDetails;
+    switch (method) {
+      case 'mpesa':
+        accountDetails = process.env.OWNER_MPESA_NUMBER;
+        break;
+      case 'bank':
+        accountDetails = `${process.env.OWNER_BANK_ACCOUNT} - ${process.env.OWNER_BANK_NAME}`;
+        break;
+      case 'paypal':
+        accountDetails = process.env.OWNER_PAYPAL_EMAIL;
+        break;
+    }
+    
+    const withdrawal = new OwnerWithdrawal({
+      amount,
+      method,
+      accountDetails,
+      notes
+    });
+    
+    await withdrawal.save();
+    
+    // Auto-process withdrawal
+    await processOwnerWithdrawal(withdrawal);
+    
+    res.json({ 
+      message: 'Withdrawal request submitted successfully',
+      withdrawal
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Owner Withdrawal History
+app.get('/api/admin/owner/withdrawals', authenticateAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status = 'all' } = req.query;
+    
+    const filter = status !== 'all' ? { status } : {};
+    
+    const withdrawals = await OwnerWithdrawal.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+    
+    const total = await OwnerWithdrawal.countDocuments(filter);
+    
+    res.json({
+      withdrawals,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page,
+      total
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Owner Withdrawal Summary
+app.get('/api/admin/owner/withdrawal-summary', authenticateAdmin, async (req, res) => {
+  try {
+    const ownerEarnings = await OwnerEarnings.findOne() || { totalEarnings: 0 };
+    
+    const [totalWithdrawn, pendingWithdrawals, thisMonthWithdrawals] = await Promise.all([
+      OwnerWithdrawal.aggregate([
+        { $match: { status: 'completed' } },
+        { $group: { _id: null, total: { $sum: '$amount' } } }
+      ]),
+      OwnerWithdrawal.countDocuments({ status: 'pending' }),
+      OwnerWithdrawal.aggregate([
+        { 
+          $match: { 
+            status: 'completed',
+            completedAt: { 
+              $gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1) 
+            }
+          } 
+        },
+        { $group: { _id: null, total: { $sum: '$amount' } } }
+      ])
+    ]);
+    
+    const availableBalance = ownerEarnings.totalEarnings - (totalWithdrawn[0]?.total || 0);
+    
+    res.json({
+      totalEarnings: ownerEarnings.totalEarnings,
+      totalWithdrawn: totalWithdrawn[0]?.total || 0,
+      availableBalance,
+      pendingWithdrawals,
+      thisMonthWithdrawals: thisMonthWithdrawals[0]?.total || 0,
+      withdrawalLimits: {
+        mpesa: process.env.MPESA_WITHDRAW_LIMIT,
+        bank: process.env.BANK_WITHDRAW_LIMIT,
+        paypal: process.env.PAYPAL_WITHDRAW_LIMIT
+      }
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
