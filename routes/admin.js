@@ -1,21 +1,847 @@
-// Payment Processing Functions
-async function processMpesaPayment(payment) {
+const express = require('express');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const path = require('path');
+const axios = require('axios');
+
+const router = express.Router();
+
+// Import models (assuming they're exported from your main server file or models file)
+// You'll need to adjust these imports based on your actual file structure
+const User = require('../models/User'); // Adjust path as needed
+const Video = require('../models/Video');
+const WatchHistory = require('../models/WatchHistory');
+const PaymentRequest = require('../models/PaymentRequest');
+const AppSettings = require('../models/AppSettings');
+const Admin = require('../models/Admin');
+const OwnerEarnings = require('../models/OwnerEarnings');
+const OwnerWithdrawal = require('../models/OwnerWithdrawal');
+
+// File upload configuration for admin video uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/videos/');
+  },
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB limit
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /mp4|avi|mov|wmv|flv|webm/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Only video files are allowed'));
+    }
+  }
+});
+
+// Admin authentication middleware
+const authenticateAdmin = async (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Admin access token required' });
+  }
+
   try {
-    // M-Pesa STK Push for user payments
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const admin = await Admin.findById(decoded.adminId);
+    if (!admin) {
+      return res.status(401).json({ error: 'Admin not found' });
+    }
+    req.admin = admin;
+    next();
+  } catch (error) {
+    return res.status(403).json({ error: 'Invalid admin token' });
+  }
+};
+
+// AUTHENTICATION ROUTES
+
+// Admin Login
+router.post('/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    
+    const admin = await Admin.findOne({ username });
+    if (!admin) {
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+    
+    const isPasswordValid = await bcrypt.compare(password, admin.password);
+    if (!isPasswordValid) {
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+    
+    const token = jwt.sign({ adminId: admin._id }, process.env.JWT_SECRET, { expiresIn: '24h' });
+    
+    admin.lastLogin = new Date();
+    await admin.save();
+    
+    res.json({
+      token,
+      admin: {
+        id: admin._id,
+        username: admin.username,
+        email: admin.email,
+        role: admin.role
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create Default Admin (Run once)
+router.post('/create-default', async (req, res) => {
+  try {
+    const existingAdmin = await Admin.findOne({ username: 'admin' });
+    if (existingAdmin) {
+      return res.status(400).json({ error: 'Default admin already exists' });
+    }
+    
+    const hashedPassword = await bcrypt.hash('admin123', 10);
+    
+    const admin = new Admin({
+      username: 'admin',
+      email: 'admin@watchearn.com',
+      password: hashedPassword,
+      role: 'super_admin'
+    });
+    
+    await admin.save();
+    
+    res.json({ message: 'Default admin created successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DASHBOARD ROUTES
+
+// Get Dashboard Statistics
+router.get('/dashboard', authenticateAdmin, async (req, res) => {
+  try {
+    const totalUsers = await User.countDocuments();
+    const totalVideos = await Video.countDocuments();
+    const totalEarnings = await OwnerEarnings.findOne() || { totalEarnings: 0, todayEarnings: 0 };
+    const pendingPayments = await PaymentRequest.countDocuments({ status: 'pending' });
+    const pendingWithdrawals = await OwnerWithdrawal.countDocuments({ status: 'pending' });
+    
+    const recentUsers = await User.find()
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .select('-password');
+    
+    const recentVideos = await Video.find()
+      .sort({ uploadedAt: -1 })
+      .limit(5);
+    
+    const recentWithdrawals = await OwnerWithdrawal.find()
+      .sort({ createdAt: -1 })
+      .limit(5);
+    
+    res.json({
+      totalUsers,
+      totalVideos,
+      totalEarnings: totalEarnings.totalEarnings,
+      todayEarnings: totalEarnings.todayEarnings,
+      pendingPayments,
+      pendingWithdrawals,
+      recentUsers,
+      recentVideos,
+      recentWithdrawals
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Analytics
+router.get('/analytics', authenticateAdmin, async (req, res) => {
+  try {
+    const { period = '7d' } = req.query;
+    
+    let dateFilter = {};
+    const now = new Date();
+    
+    switch (period) {
+      case '24h':
+        dateFilter = { createdAt: { $gte: new Date(now - 24 * 60 * 60 * 1000) } };
+        break;
+      case '7d':
+        dateFilter = { createdAt: { $gte: new Date(now - 7 * 24 * 60 * 60 * 1000) } };
+        break;
+      case '30d':
+        dateFilter = { createdAt: { $gte: new Date(now - 30 * 24 * 60 * 60 * 1000) } };
+        break;
+      case '90d':
+        dateFilter = { createdAt: { $gte: new Date(now - 90 * 24 * 60 * 60 * 1000) } };
+        break;
+    }
+    
+    const [
+      newUsers,
+      totalVideoViews,
+      totalPayments,
+      activeUsers
+    ] = await Promise.all([
+      User.countDocuments(dateFilter),
+      WatchHistory.countDocuments(dateFilter),
+      PaymentRequest.countDocuments(dateFilter),
+      User.countDocuments({
+        lastActivity: { $gte: new Date(now - 24 * 60 * 60 * 1000) }
+      })
+    ]);
+    
+    // Get earnings by day
+    const earningsHistory = await OwnerEarnings.findOne();
+    const dailyEarnings = earningsHistory ? earningsHistory.earningsHistory.filter(
+      e => e.date >= new Date(now - 30 * 24 * 60 * 60 * 1000)
+    ) : [];
+    
+    res.json({
+      newUsers,
+      totalVideoViews,
+      totalPayments,
+      activeUsers,
+      dailyEarnings
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// USER MANAGEMENT ROUTES
+
+// Get All Users
+router.get('/users', authenticateAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, search = '' } = req.query;
+    
+    const filter = search 
+      ? { email: { $regex: search, $options: 'i' } }
+      : {};
+    
+    const users = await User.find(filter)
+      .select('-password')
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+    
+    const total = await User.countDocuments(filter);
+    
+    res.json({
+      users,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page,
+      total
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update User Balance
+router.patch('/users/:id/balance', authenticateAdmin, async (req, res) => {
+  try {
+    const { balance } = req.body;
+    const userId = req.params.id;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    user.balance = balance;
+    await user.save();
+    
+    res.json({ message: 'User balance updated successfully', user });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Bulk Operations
+router.post('/bulk-operations', authenticateAdmin, async (req, res) => {
+  try {
+    const { operation, userIds, amount } = req.body;
+    
+    switch (operation) {
+      case 'addBalance':
+        await User.updateMany(
+          { _id: { $in: userIds } },
+          { $inc: { balance: amount, totalEarned: amount } }
+        );
+        break;
+      case 'deductBalance':
+        await User.updateMany(
+          { _id: { $in: userIds } },
+          { $inc: { balance: -amount } }
+        );
+        break;
+      case 'resetBalance':
+        await User.updateMany(
+          { _id: { $in: userIds } },
+          { $set: { balance: 0 } }
+        );
+        break;
+      case 'deleteUsers':
+        await User.deleteMany({ _id: { $in: userIds } });
+        break;
+    }
+    
+    res.json({ message: `Bulk ${operation} completed successfully` });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// VIDEO MANAGEMENT ROUTES
+
+// Upload Video
+router.post('/videos/upload', authenticateAdmin, upload.single('video'), async (req, res) => {
+  try {
+    const { title, description, duration } = req.body;
+    
+    if (!req.file) {
+      return res.status(400).json({ error: 'Video file is required' });
+    }
+    
+    const video = new Video({
+      title,
+      description,
+      filename: req.file.filename,
+      originalName: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      duration: parseInt(duration) || 0
+    });
+    
+    await video.save();
+    
+    res.json({ message: 'Video uploaded successfully', video });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get All Videos (Admin)
+router.get('/videos', authenticateAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+    
+    const videos = await Video.find()
+      .sort({ uploadedAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+    
+    const total = await Video.countDocuments();
+    
+    res.json({
+      videos,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page,
+      total
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update Video
+router.patch('/videos/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { title, description, isActive } = req.body;
+    const videoId = req.params.id;
+    
+    const video = await Video.findById(videoId);
+    if (!video) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+    
+    if (title) video.title = title;
+    if (description) video.description = description;
+    if (typeof isActive !== 'undefined') video.isActive = isActive;
+    
+    await video.save();
+    
+    res.json({ message: 'Video updated successfully', video });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete Video
+router.delete('/videos/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const video = await Video.findByIdAndDelete(req.params.id);
+    if (!video) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+    
+    res.json({ message: 'Video deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PAYMENT MANAGEMENT ROUTES
+
+// Get Payment Requests
+router.get('/payments', authenticateAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status = 'all' } = req.query;
+    
+    const filter = status !== 'all' ? { status } : {};
+    
+    const payments = await PaymentRequest.find(filter)
+      .populate('userId', 'email')
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+    
+    const total = await PaymentRequest.countDocuments(filter);
+    
+    res.json({
+      payments,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page,
+      total
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Approve/Reject Payment
+router.patch('/payments/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { status, transactionId } = req.body;
+    const paymentId = req.params.id;
+    
+    const payment = await PaymentRequest.findById(paymentId).populate('userId');
+    if (!payment) {
+      return res.status(404).json({ error: 'Payment request not found' });
+    }
+    
+    if (status === 'approved') {
+      // Process payment based on method
+      if (payment.method === 'mpesa') {
+        await processMpesaPayment(payment);
+      } else if (payment.method === 'paypal') {
+        await processPayPalPayment(payment);
+      }
+      
+      // Deduct from user balance
+      const user = payment.userId;
+      user.balance -= payment.amount;
+      await user.save();
+    }
+    
+    payment.status = status;
+    payment.transactionId = transactionId;
+    payment.processedAt = new Date();
+    await payment.save();
+    
+    res.json({ message: `Payment ${status} successfully`, payment });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// OWNER EARNINGS & WITHDRAWAL ROUTES
+
+// Get Owner Earnings
+router.get('/owner-earnings', authenticateAdmin, async (req, res) => {
+  try {
+    let earnings = await OwnerEarnings.findOne();
+    if (!earnings) {
+      earnings = new OwnerEarnings();
+      await earnings.save();
+    }
+    
+    res.json(earnings);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reset Daily Earnings
+router.post('/reset-daily-earnings', authenticateAdmin, async (req, res) => {
+  try {
+    let earnings = await OwnerEarnings.findOne();
+    if (!earnings) {
+      earnings = new OwnerEarnings();
+    }
+    
+    earnings.todayEarnings = 0;
+    earnings.lastReset = new Date();
+    await earnings.save();
+    
+    res.json({ message: 'Daily earnings reset successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Request Owner Withdrawal
+router.post('/owner/withdraw', authenticateAdmin, async (req, res) => {
+  try {
+    const { amount, method, notes } = req.body;
+    
+    // Check withdrawal limits
+    const limits = {
+      mpesa: parseFloat(process.env.MPESA_WITHDRAW_LIMIT) || 70000,
+      bank: parseFloat(process.env.BANK_WITHDRAW_LIMIT) || 1000000,
+      paypal: parseFloat(process.env.PAYPAL_WITHDRAW_LIMIT) || 10000
+    };
+    
+    if (amount > limits[method]) {
+      return res.status(400).json({ 
+        error: `Amount exceeds ${method.toUpperCase()} limit of ${limits[method]}` 
+      });
+    }
+    
+    // Check available balance
+    const ownerEarnings = await OwnerEarnings.findOne();
+    if (!ownerEarnings || ownerEarnings.totalEarnings < amount) {
+      return res.status(400).json({ error: 'Insufficient owner earnings' });
+    }
+    
+    // Get account details from environment
+    let accountDetails;
+    switch (method) {
+      case 'mpesa':
+        accountDetails = process.env.OWNER_MPESA_NUMBER;
+        break;
+      case 'bank':
+        accountDetails = `${process.env.OWNER_BANK_ACCOUNT} - ${process.env.OWNER_BANK_NAME}`;
+        break;
+      case 'paypal':
+        accountDetails = process.env.OWNER_PAYPAL_EMAIL;
+        break;
+    }
+    
+    const withdrawal = new OwnerWithdrawal({
+      amount,
+      method,
+      accountDetails,
+      notes
+    });
+    
+    await withdrawal.save();
+    
+    // Auto-process withdrawal
+    await processOwnerWithdrawal(withdrawal);
+    
+    res.json({ 
+      message: 'Withdrawal request submitted successfully',
+      withdrawal
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Owner Withdrawal History
+router.get('/owner/withdrawals', authenticateAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status = 'all' } = req.query;
+    
+    const filter = status !== 'all' ? { status } : {};
+    
+    const withdrawals = await OwnerWithdrawal.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+    
+    const total = await OwnerWithdrawal.countDocuments(filter);
+    
+    res.json({
+      withdrawals,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page,
+      total
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Owner Withdrawal Summary
+router.get('/owner/withdrawal-summary', authenticateAdmin, async (req, res) => {
+  try {
+    const ownerEarnings = await OwnerEarnings.findOne() || { totalEarnings: 0 };
+    
+    const [totalWithdrawn, pendingWithdrawals, thisMonthWithdrawals] = await Promise.all([
+      OwnerWithdrawal.aggregate([
+        { $match: { status: 'completed' } },
+        { $group: { _id: null, total: { $sum: '$amount' } } }
+      ]),
+      OwnerWithdrawal.countDocuments({ status: 'pending' }),
+      OwnerWithdrawal.aggregate([
+        { 
+          $match: { 
+            status: 'completed',
+            completedAt: { 
+              $gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1) 
+            }
+          } 
+        },
+        { $group: { _id: null, total: { $sum: '$amount' } } }
+      ])
+    ]);
+    
+    const availableBalance = ownerEarnings.totalEarnings - (totalWithdrawn[0]?.total || 0);
+    
+    res.json({
+      totalEarnings: ownerEarnings.totalEarnings,
+      totalWithdrawn: totalWithdrawn[0]?.total || 0,
+      availableBalance,
+      pendingWithdrawals,
+      thisMonthWithdrawals: thisMonthWithdrawals[0]?.total || 0,
+      withdrawalLimits: {
+        mpesa: process.env.MPESA_WITHDRAW_LIMIT || 70000,
+        bank: process.env.BANK_WITHDRAW_LIMIT || 1000000,
+        paypal: process.env.PAYPAL_WITHDRAW_LIMIT || 10000
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// M-Pesa Owner Withdrawal Callbacks
+router.post('/owner/mpesa/result', async (req, res) => {
+  try {
+    const { Result } = req.body;
+    
+    if (Result.ResultCode === 0) {
+      const withdrawal = await OwnerWithdrawal.findOne({
+        transactionId: Result.ConversationID
+      });
+      
+      if (withdrawal) {
+        withdrawal.status = 'completed';
+        withdrawal.completedAt = new Date();
+        await withdrawal.save();
+        
+        // Deduct from owner earnings
+        const ownerEarnings = await OwnerEarnings.findOne();
+        if (ownerEarnings) {
+          ownerEarnings.totalEarnings -= withdrawal.amount;
+          await ownerEarnings.save();
+        }
+      }
+    } else {
+      const withdrawal = await OwnerWithdrawal.findOne({
+        transactionId: Result.ConversationID
+      });
+      
+      if (withdrawal) {
+        withdrawal.status = 'failed';
+        withdrawal.notes = Result.ResultDesc;
+        await withdrawal.save();
+      }
+    }
+    
+    res.status(200).json({ message: 'Result received' });
+  } catch (error) {
+    console.error('M-Pesa result callback error:', error);
+    res.status(500).json({ error: 'Callback processing failed' });
+  }
+});
+
+router.post('/owner/mpesa/timeout', async (req, res) => {
+  try {
+    const { ConversationID } = req.body;
+    
+    const withdrawal = await OwnerWithdrawal.findOne({
+      transactionId: ConversationID
+    });
+    
+    if (withdrawal) {
+      withdrawal.status = 'failed';
+      withdrawal.notes = 'Transaction timed out';
+      await withdrawal.save();
+    }
+    
+    res.status(200).json({ message: 'Timeout received' });
+  } catch (error) {
+    console.error('M-Pesa timeout callback error:', error);
+    res.status(500).json({ error: 'Callback processing failed' });
+  }
+});
+
+// APP SETTINGS ROUTES
+
+// Get App Settings
+router.get('/settings', authenticateAdmin, async (req, res) => {
+  try {
+    let settings = await AppSettings.findOne();
+    if (!settings) {
+      settings = new AppSettings();
+      await settings.save();
+    }
+    
+    res.json(settings);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update App Settings
+router.put('/settings', authenticateAdmin, async (req, res) => {
+  try {
+    const updates = req.body;
+    
+    let settings = await AppSettings.findOne();
+    if (!settings) {
+      settings = new AppSettings();
+    }
+    
+    Object.assign(settings, updates);
+    settings.lastUpdated = new Date();
+    await settings.save();
+    
+    res.json({ message: 'Settings updated successfully', settings });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// MAINTENANCE & UTILITY ROUTES
+
+// Reset App Data
+router.post('/reset-app', authenticateAdmin, async (req, res) => {
+  try {
+    const { resetType } = req.body;
+    
+    if (resetType === 'users') {
+      await User.deleteMany({});
+    } else if (resetType === 'videos') {
+      await Video.deleteMany({});
+      await WatchHistory.deleteMany({});
+    } else if (resetType === 'payments') {
+      await PaymentRequest.deleteMany({});
+    } else if (resetType === 'all') {
+      await User.deleteMany({});
+      await Video.deleteMany({});
+      await WatchHistory.deleteMany({});
+      await PaymentRequest.deleteMany({});
+      await OwnerEarnings.deleteMany({});
+    }
+    
+    res.json({ message: `${resetType} data reset successfully` });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Export Data
+router.get('/export/:type', authenticateAdmin, async (req, res) => {
+  try {
+    const { type } = req.params;
+    let data;
+    
+    switch (type) {
+      case 'users':
+        data = await User.find().select('-password');
+        break;
+      case 'videos':
+        data = await Video.find();
+        break;
+      case 'payments':
+        data = await PaymentRequest.find().populate('userId', 'email');
+        break;
+      case 'watch-history':
+        data = await WatchHistory.find()
+          .populate('userId', 'email')
+          .populate('videoId', 'title');
+        break;
+      default:
+        return res.status(400).json({ error: 'Invalid export type' });
+    }
+    
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename=${type}-export.json`);
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// HELPER FUNCTIONS
+
+// Owner Withdrawal Processing
+async function processOwnerWithdrawal(withdrawal) {
+  try {
+    let result;
+    
+    switch (withdrawal.method) {
+      case 'mpesa':
+        result = await processOwnerMpesaWithdrawal(withdrawal);
+        break;
+      case 'bank':
+        result = await processOwnerBankWithdrawal(withdrawal);
+        break;
+      case 'paypal':
+        result = await processOwnerPayPalWithdrawal(withdrawal);
+        break;
+    }
+    
+    if (result.success) {
+      withdrawal.status = 'completed';
+      withdrawal.transactionId = result.transactionId;
+      withdrawal.completedAt = new Date();
+      
+      // Deduct from owner earnings
+      const ownerEarnings = await OwnerEarnings.findOne();
+      if (ownerEarnings) {
+        ownerEarnings.totalEarnings -= withdrawal.amount;
+        await ownerEarnings.save();
+      }
+    } else {
+      withdrawal.status = 'failed';
+      withdrawal.notes = result.error;
+    }
+    
+    await withdrawal.save();
+    return result;
+  } catch (error) {
+    withdrawal.status = 'failed';
+    withdrawal.notes = error.message;
+    await withdrawal.save();
+    throw error;
+  }
+}
+
+async function processOwnerMpesaWithdrawal(withdrawal) {
+  try {
     const response = await axios.post(
-      `${process.env.MPESA_BASE_URL}/mpesa/stkpush/v1/processrequest`,
+      `${process.env.MPESA_BASE_URL}/mpesa/b2c/v1/paymentrequest`,
       {
-        BusinessShortCode: process.env.MPESA_SHORTCODE,
-        Password: process.env.MPESA_PASSWORD,
-        Timestamp: new Date().toISOString().replace(/[-:]/g, '').slice(0, 14),
-        TransactionType: 'CustomerPayBillOnline',
-        Amount: payment.amount,
-        PartyA: payment.phoneNumber,
-        PartyB: process.env.MPESA_SHORTCODE,
-        PhoneNumber: payment.phoneNumber,
-        CallBackURL: `${process.env.BASE_URL}/api/admin/mpesa/callback`,
-        AccountReference: `WatchEarn-${payment._id}`,
-        TransactionDesc: 'Payment withdrawal request'
+        InitiatorName: process.env.MPESA_INITIATOR_NAME,
+        SecurityCredential: process.env.MPESA_SECURITY_CREDENTIAL,
+        CommandID: 'BusinessPayment',
+        Amount: withdrawal.amount,
+        PartyA: process.env.MPESA_SHORTCODE,
+        PartyB: withdrawal.accountDetails,
+        Remarks: 'Owner withdrawal',
+        QueueTimeOutURL: `${process.env.BASE_URL}/api/admin/owner/mpesa/timeout`,
+        ResultURL: `${process.env.BASE_URL}/api/admin/owner/mpesa/result`,
+        Occasion: 'Owner Withdrawal'
       },
       {
         headers: {
@@ -24,442 +850,54 @@ async function processMpesaPayment(payment) {
         }
       }
     );
-
+    
     return {
       success: true,
-      transactionId: response.data.CheckoutRequestID
+      transactionId: response.data.ConversationID
     };
   } catch (error) {
-    console.error('M-Pesa payment error:', error);
     return {
       success: false,
-      error: `M-Pesa payment failed: ${error.message}`
+      error: `M-Pesa withdrawal failed: ${error.message}`
     };
   }
 }
 
-async function processPayPalPayment(payment) {
+async function processOwnerBankWithdrawal(withdrawal) {
   try {
-    // PayPal Payout API
+    const transactionId = `BANK-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Log withdrawal for manual processing
+    console.log(`Bank withdrawal requested: ${withdrawal.amount} to ${withdrawal.accountDetails}`);
+    
+    return {
+      success: true,
+      transactionId
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Bank withdrawal failed: ${error.message}`
+    };
+  }
+}
+
+async function processOwnerPayPalWithdrawal(withdrawal) {
+  try {
     const response = await axios.post(
       `${process.env.PAYPAL_BASE_URL}/v1/payments/payouts`,
       {
         sender_batch_header: {
-          sender_batch_id: `batch-${payment._id}`,
-          email_subject: 'You have a payout!',
-          email_message: 'Your WatchEarn withdrawal has been processed'
+          sender_batch_id: `owner-batch-${withdrawal._id}`,
+          email_subject: 'Owner Withdrawal',
+          email_message: 'Your withdrawal has been processed'
         },
         items: [{
           recipient_type: 'EMAIL',
           amount: {
-            value: payment.amount.toString(),
+            value: withdrawal.amount.toString(),
             currency: 'USD'
           },
-          receiver: payment.email,
-          note: 'WatchEarn withdrawal',
-          sender_item_id: `item-${payment._id}`
-        }]
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.PAYPAL_ACCESS_TOKEN}`
-        }
-      }
-    );
-
-    return {
-      success: true,
-      transactionId: response.data.batch_header.payout_batch_id
-    };
-  } catch (error) {
-    console.error('PayPal payment error:', error);
-    return {
-      success: false,
-      error: `PayPal payment failed: ${error.message}`
-    };
-  }
-}
-
-// M-Pesa Callback Routes
-router.post('/mpesa/callback', async (req, res) => {
-  try {
-    const { Body } = req.body;
-    const { stkCallback } = Body;
-    
-    if (stkCallback.ResultCode === 0) {
-      // Payment successful
-      const checkoutRequestID = stkCallback.CheckoutRequestID;
-      
-      // Find payment by transaction ID
-      const payment = await PaymentRequest.findOne({
-        transactionId: checkoutRequestID
-      });
-      
-      if (payment) {
-        payment.status = 'completed';
-        payment.completedAt = new Date();
-        
-        // Extract M-Pesa receipt number
-        const callbackMetadata = stkCallback.CallbackMetadata;
-        const receiptItem = callbackMetadata.Item.find(item => 
-          item.Name === 'MpesaReceiptNumber'
-        );
-        
-        if (receiptItem) {
-          payment.mpesaReceiptNumber = receiptItem.Value;
-        }
-        
-        await payment.save();
-        
-        // Deduct from user balance
-        const user = await User.findById(payment.userId);
-        if (user) {
-          user.balance -= payment.amount;
-          await user.save();
-        }
-      }
-    } else {
-      // Payment failed
-      const checkoutRequestID = stkCallback.CheckoutRequestID;
-      const payment = await PaymentRequest.findOne({
-        transactionId: checkoutRequestID
-      });
-      
-      if (payment) {
-        payment.status = 'failed';
-        payment.notes = stkCallback.ResultDesc;
-        await payment.save();
-      }
-    }
-    
-    res.status(200).json({ message: 'Callback received' });
-  } catch (error) {
-    console.error('M-Pesa callback error:', error);
-    res.status(500).json({ error: 'Callback processing failed' });
-  }
-});
-
-// Additional utility routes
-router.get('/system-health', authenticateAdmin, async (req, res) => {
-  try {
-    const mongoStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
-    const uptime = process.uptime();
-    const memoryUsage = process.memoryUsage();
-    
-    // Check disk space for uploads
-    const fs = require('fs');
-    const path = require('path');
-    const uploadDir = path.join(__dirname, '../uploads/videos');
-    
-    let diskSpace = 'unknown';
-    try {
-      const stats = fs.statSync(uploadDir);
-      diskSpace = `${(stats.size / (1024 * 1024)).toFixed(2)} MB`;
-    } catch (error) {
-      diskSpace = 'directory not found';
-    }
-    
-    res.json({
-      status: 'healthy',
-      timestamp: new Date(),
-      database: mongoStatus,
-      uptime: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`,
-      memory: {
-        used: `${(memoryUsage.heapUsed / 1024 / 1024).toFixed(2)} MB`,
-        total: `${(memoryUsage.heapTotal / 1024 / 1024).toFixed(2)} MB`
-      },
-      diskSpace
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Admin activity log
-router.get('/activity-log', authenticateAdmin, async (req, res) => {
-  try {
-    const { page = 1, limit = 50 } = req.query;
-    
-    // This would require an ActivityLog model to be created
-    // For now, we'll return recent admin actions from various collections
-    const recentActions = await Promise.all([
-      PaymentRequest.find({ status: { $ne: 'pending' } })
-        .sort({ processedAt: -1 })
-        .limit(20)
-        .select('amount method status processedAt userId')
-        .populate('userId', 'email'),
-      
-      Video.find()
-        .sort({ uploadedAt: -1 })
-        .limit(10)
-        .select('title uploadedAt size'),
-      
-      User.find()
-        .sort({ createdAt: -1 })
-        .limit(10)
-        .select('email createdAt balance')
-    ]);
-    
-    const [payments, videos, users] = recentActions;
-    
-    const activityLog = [
-      ...payments.map(p => ({
-        type: 'payment',
-        action: `Payment ${p.status}`,
-        details: `${p.amount} via ${p.method} for ${p.userId?.email}`,
-        timestamp: p.processedAt || p.createdAt
-      })),
-      ...videos.map(v => ({
-        type: 'video',
-        action: 'Video uploaded',
-        details: `${v.title} (${(v.size / (1024 * 1024)).toFixed(2)} MB)`,
-        timestamp: v.uploadedAt
-      })),
-      ...users.map(u => ({
-        type: 'user',
-        action: 'User registered',
-        details: `${u.email} (Balance: ${u.balance})`,
-        timestamp: u.createdAt
-      }))
-    ].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-     .slice(0, limit);
-    
-    res.json({
-      activityLog,
-      total: activityLog.length,
-      page: parseInt(page)
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Batch user operations
-router.post('/users/batch-update', authenticateAdmin, async (req, res) => {
-  try {
-    const { operation, userIds, value } = req.body;
-    
-    if (!Array.isArray(userIds) || userIds.length === 0) {
-      return res.status(400).json({ error: 'User IDs array is required' });
-    }
-    
-    let updateQuery = {};
-    let updateDescription = '';
-    
-    switch (operation) {
-      case 'activate':
-        updateQuery = { isActive: true };
-        updateDescription = 'activated';
-        break;
-      case 'deactivate':
-        updateQuery = { isActive: false };
-        updateDescription = 'deactivated';
-        break;
-      case 'setBalance':
-        updateQuery = { balance: parseFloat(value) || 0 };
-        updateDescription = `balance set to ${value}`;
-        break;
-      case 'addBalance':
-        updateQuery = { $inc: { balance: parseFloat(value) || 0 } };
-        updateDescription = `balance increased by ${value}`;
-        break;
-      case 'resetWatchTime':
-        updateQuery = { watchTime: 0 };
-        updateDescription = 'watch time reset';
-        break;
-      default:
-        return res.status(400).json({ error: 'Invalid operation' });
-    }
-    
-    const result = await User.updateMany(
-      { _id: { $in: userIds } },
-      updateQuery
-    );
-    
-    res.json({
-      message: `${result.modifiedCount} users ${updateDescription}`,
-      affectedUsers: result.modifiedCount
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Video analytics
-router.get('/videos/:id/analytics', authenticateAdmin, async (req, res) => {
-  try {
-    const videoId = req.params.id;
-    
-    const video = await Video.findById(videoId);
-    if (!video) {
-      return res.status(404).json({ error: 'Video not found' });
-    }
-    
-    const analytics = await WatchHistory.aggregate([
-      { $match: { videoId: mongoose.Types.ObjectId(videoId) } },
-      {
-        $group: {
-          _id: null,
-          totalViews: { $sum: 1 },
-          totalWatchTime: { $sum: '$watchTime' },
-          avgWatchTime: { $avg: '$watchTime' },
-          uniqueViewers: { $addToSet: '$userId' }
-        }
-      },
-      {
-        $project: {
-          totalViews: 1,
-          totalWatchTime: 1,
-          avgWatchTime: 1,
-          uniqueViewers: { $size: '$uniqueViewers' }
-        }
-      }
-    ]);
-    
-    const viewsByDay = await WatchHistory.aggregate([
-      { $match: { videoId: mongoose.Types.ObjectId(videoId) } },
-      {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-          views: { $sum: 1 },
-          watchTime: { $sum: '$watchTime' }
-        }
-      },
-      { $sort: { _id: -1 } },
-      { $limit: 30 }
-    ]);
-    
-    res.json({
-      video: {
-        id: video._id,
-        title: video.title,
-        duration: video.duration,
-        uploadedAt: video.uploadedAt
-      },
-      analytics: analytics[0] || {
-        totalViews: 0,
-        totalWatchTime: 0,
-        avgWatchTime: 0,
-        uniqueViewers: 0
-      },
-      viewsByDay: viewsByDay.reverse()
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Generate reports
-router.get('/reports/:type', authenticateAdmin, async (req, res) => {
-  try {
-    const { type } = req.params;
-    const { startDate, endDate } = req.query;
-    
-    const dateFilter = {};
-    if (startDate && endDate) {
-      dateFilter.createdAt = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate)
-      };
-    }
-    
-    let report = {};
-    
-    switch (type) {
-      case 'earnings':
-        const earningsData = await OwnerEarnings.findOne();
-        const withdrawals = await OwnerWithdrawal.find(dateFilter);
-        
-        report = {
-          totalEarnings: earningsData?.totalEarnings || 0,
-          todayEarnings: earningsData?.todayEarnings || 0,
-          totalWithdrawals: withdrawals.reduce((sum, w) => sum + w.amount, 0),
-          withdrawalCount: withdrawals.length,
-          averageWithdrawal: withdrawals.length > 0 ? 
-            withdrawals.reduce((sum, w) => sum + w.amount, 0) / withdrawals.length : 0
-        };
-        break;
-        
-      case 'users':
-        const totalUsers = await User.countDocuments();
-        const activeUsers = await User.countDocuments({ 
-          lastActivity: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
-        });
-        const newUsers = await User.countDocuments(dateFilter);
-        
-        report = {
-          totalUsers,
-          activeUsers,
-          newUsers,
-          activityRate: ((activeUsers / totalUsers) * 100).toFixed(2) + '%'
-        };
-        break;
-        
-      case 'videos':
-        const totalVideos = await Video.countDocuments();
-        const totalViews = await WatchHistory.countDocuments(dateFilter);
-        const avgViewsPerVideo = totalVideos > 0 ? (totalViews / totalVideos).toFixed(2) : 0;
-        
-        report = {
-          totalVideos,
-          totalViews,
-          avgViewsPerVideo,
-          newVideos: await Video.countDocuments(dateFilter)
-        };
-        break;
-        
-      default:
-        return res.status(400).json({ error: 'Invalid report type' });
-    }
-    
-    res.json({
-      reportType: type,
-      dateRange: { startDate, endDate },
-      generatedAt: new Date(),
-      data: report
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Clean up old data
-router.post('/cleanup', authenticateAdmin, async (req, res) => {
-  try {
-    const { type, days = 30 } = req.body;
-    const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    
-    let result = {};
-    
-    switch (type) {
-      case 'watch-history':
-        result = await WatchHistory.deleteMany({ createdAt: { $lt: cutoffDate } });
-        break;
-      case 'completed-payments':
-        result = await PaymentRequest.deleteMany({ 
-          status: 'completed',
-          processedAt: { $lt: cutoffDate }
-        });
-        break;
-      case 'failed-payments':
-        result = await PaymentRequest.deleteMany({ 
-          status: 'failed',
-          createdAt: { $lt: cutoffDate }
-        });
-        break;
-      default:
-        return res.status(400).json({ error: 'Invalid cleanup type' });
-    }
-    
-    res.json({
-      message: `Cleanup completed for ${type}`,
-      deletedCount: result.deletedCount,
-      cutoffDate
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-module.exports = router;
+          receiver: withdrawal.accountDetails,
+          note: 'Owner withdrawal from WatchEarn',
+          sender_item_id: `owner-item-${withdrawal._
