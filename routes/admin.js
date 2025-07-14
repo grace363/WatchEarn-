@@ -882,6 +882,7 @@ async function processOwnerBankWithdrawal(withdrawal) {
   }
 }
 
+// Complete the processOwnerPayPalWithdrawal function
 async function processOwnerPayPalWithdrawal(withdrawal) {
   try {
     const response = await axios.post(
@@ -900,4 +901,299 @@ async function processOwnerPayPalWithdrawal(withdrawal) {
           },
           receiver: withdrawal.accountDetails,
           note: 'Owner withdrawal from WatchEarn',
-          sender_item_id: `owner-item-${withdrawal._
+          sender_item_id: `owner-item-${withdrawal._id}`
+        }]
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.PAYPAL_ACCESS_TOKEN}`
+        }
+      }
+    );
+    
+    return {
+      success: true,
+      transactionId: response.data.batch_header.payout_batch_id
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `PayPal withdrawal failed: ${error.message}`
+    };
+  }
+}
+
+// Regular Payment Processing Functions (already in your server but needed for router)
+async function processMpesaPayment(payment) {
+  try {
+    const response = await axios.post(
+      `${process.env.MPESA_BASE_URL}/mpesa/b2c/v1/paymentrequest`,
+      {
+        InitiatorName: process.env.MPESA_INITIATOR_NAME,
+        SecurityCredential: process.env.MPESA_SECURITY_CREDENTIAL,
+        CommandID: 'BusinessPayment',
+        Amount: payment.amount,
+        PartyA: process.env.MPESA_SHORTCODE,
+        PartyB: payment.accountDetails,
+        Remarks: 'Payment from WatchEarn',
+        QueueTimeOutURL: `${process.env.BASE_URL}/api/payments/mpesa/timeout`,
+        ResultURL: `${process.env.BASE_URL}/api/payments/mpesa/result`,
+        Occasion: 'User Payment'
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.MPESA_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    return response.data;
+  } catch (error) {
+    throw new Error(`M-Pesa payment failed: ${error.message}`);
+  }
+}
+
+async function processPayPalPayment(payment) {
+  try {
+    const response = await axios.post(
+      `${process.env.PAYPAL_BASE_URL}/v1/payments/payouts`,
+      {
+        sender_batch_header: {
+          sender_batch_id: `batch-${payment._id}`,
+          email_subject: 'You have a payout!',
+          email_message: 'You have received a payout from WatchEarn!'
+        },
+        items: [{
+          recipient_type: 'EMAIL',
+          amount: {
+            value: payment.amount.toString(),
+            currency: 'USD'
+          },
+          receiver: payment.accountDetails,
+          note: 'Payment from WatchEarn',
+          sender_item_id: `item-${payment._id}`
+        }]
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.PAYPAL_ACCESS_TOKEN}`
+        }
+      }
+    );
+    
+    return response.data;
+  } catch (error) {
+    throw new Error(`PayPal payment failed: ${error.message}`);
+  }
+}
+
+// Regular M-Pesa Payment Callbacks
+router.post('/payments/mpesa/result', async (req, res) => {
+  try {
+    const { Result } = req.body;
+    
+    if (Result.ResultCode === 0) {
+      const payment = await PaymentRequest.findOne({
+        transactionId: Result.ConversationID
+      });
+      
+      if (payment) {
+        payment.status = 'approved';
+        payment.processedAt = new Date();
+        await payment.save();
+        
+        // Deduct from user balance
+        const user = await User.findById(payment.userId);
+        if (user) {
+          user.balance -= payment.amount;
+          await user.save();
+        }
+      }
+    } else {
+      const payment = await PaymentRequest.findOne({
+        transactionId: Result.ConversationID
+      });
+      
+      if (payment) {
+        payment.status = 'failed';
+        payment.notes = Result.ResultDesc;
+        await payment.save();
+      }
+    }
+    
+    res.status(200).json({ message: 'Result received' });
+  } catch (error) {
+    console.error('M-Pesa result callback error:', error);
+    res.status(500).json({ error: 'Callback processing failed' });
+  }
+});
+
+router.post('/payments/mpesa/timeout', async (req, res) => {
+  try {
+    const { ConversationID } = req.body;
+    
+    const payment = await PaymentRequest.findOne({
+      transactionId: ConversationID
+    });
+    
+    if (payment) {
+      payment.status = 'failed';
+      payment.notes = 'Transaction timed out';
+      await payment.save();
+    }
+    
+    res.status(200).json({ message: 'Timeout received' });
+  } catch (error) {
+    console.error('M-Pesa timeout callback error:', error);
+    res.status(500).json({ error: 'Callback processing failed' });
+  }
+});
+
+// Admin Management Routes
+router.get('/admins', authenticateAdmin, async (req, res) => {
+  try {
+    const admins = await Admin.find().select('-password');
+    res.json(admins);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/admins', authenticateAdmin, async (req, res) => {
+  try {
+    const { username, email, password, role } = req.body;
+    
+    const existingAdmin = await Admin.findOne({ 
+      $or: [{ username }, { email }] 
+    });
+    
+    if (existingAdmin) {
+      return res.status(400).json({ error: 'Username or email already exists' });
+    }
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    const admin = new Admin({
+      username,
+      email,
+      password: hashedPassword,
+      role: role || 'admin'
+    });
+    
+    await admin.save();
+    
+    res.json({ 
+      message: 'Admin created successfully',
+      admin: {
+        id: admin._id,
+        username: admin.username,
+        email: admin.email,
+        role: admin.role
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const admin = await Admin.findByIdAndDelete(req.params.id);
+    if (!admin) {
+      return res.status(404).json({ error: 'Admin not found' });
+    }
+    
+    res.json({ message: 'Admin deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// System Health Check
+router.get('/health', authenticateAdmin, async (req, res) => {
+  try {
+    const health = {
+      status: 'healthy',
+      timestamp: new Date(),
+      database: 'connected',
+      services: {
+        mpesa: process.env.MPESA_BASE_URL ? 'configured' : 'not configured',
+        paypal: process.env.PAYPAL_BASE_URL ? 'configured' : 'not configured',
+        email: process.env.EMAIL_HOST ? 'configured' : 'not configured'
+      },
+      memory: process.memoryUsage(),
+      uptime: process.uptime()
+    };
+    
+    res.json(health);
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'unhealthy',
+      error: error.message 
+    });
+  }
+});
+
+// Change Admin Password
+router.patch('/change-password', authenticateAdmin, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    
+    const admin = await Admin.findById(req.admin._id);
+    if (!admin) {
+      return res.status(404).json({ error: 'Admin not found' });
+    }
+    
+    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, admin.password);
+    if (!isCurrentPasswordValid) {
+      return res.status(400).json({ error: 'Current password is incorrect' });
+    }
+    
+    const hashedNewPassword = await bcrypt.hash(newPassword, 10);
+    admin.password = hashedNewPassword;
+    await admin.save();
+    
+    res.json({ message: 'Password changed successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get System Statistics
+router.get('/stats/system', authenticateAdmin, async (req, res) => {
+  try {
+    const stats = {
+      totalUsers: await User.countDocuments(),
+      activeUsers: await User.countDocuments({
+        lastActivity: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+      }),
+      totalVideos: await Video.countDocuments(),
+      totalViews: await WatchHistory.countDocuments(),
+      totalPayments: await PaymentRequest.countDocuments(),
+      pendingPayments: await PaymentRequest.countDocuments({ status: 'pending' }),
+      approvedPayments: await PaymentRequest.countDocuments({ status: 'approved' }),
+      rejectedPayments: await PaymentRequest.countDocuments({ status: 'rejected' }),
+      totalEarnings: (await OwnerEarnings.findOne())?.totalEarnings || 0,
+      todayEarnings: (await OwnerEarnings.findOne())?.todayEarnings || 0
+    };
+    
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Logout Admin
+router.post('/logout', authenticateAdmin, async (req, res) => {
+  try {
+    // In a real implementation, you might want to blacklist the token
+    res.json({ message: 'Logged out successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+module.exports = router;
